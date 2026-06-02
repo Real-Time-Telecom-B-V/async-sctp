@@ -106,6 +106,83 @@ impl SctpAssociation {
         Ok(Self { inner })
     }
 
+    /// Connect to a multihomed peer across one or more remote addresses,
+    /// which may mix IPv4 and IPv6, using `sctp_connectx`. The local socket
+    /// family follows the address set (v6 with `IPV6_V6ONLY=0` if any v6).
+    pub async fn connect_multi(addrs: &[SocketAddr]) -> Result<Self, SctpError> {
+        if addrs.is_empty() {
+            return Err(SctpError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no connect addresses",
+            )));
+        }
+        let domain = if addrs.iter().any(SocketAddr::is_ipv6) {
+            libc::AF_INET6
+        } else {
+            libc::AF_INET
+        };
+
+        let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, sys::IPPROTO_SCTP) };
+        if fd < 0 {
+            return Err(SctpError::Io(io::Error::last_os_error()));
+        }
+        set_nonblocking(fd)?;
+        configure_events(fd)?;
+        if domain == libc::AF_INET6 {
+            let off: libc::c_int = 0;
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_IPV6,
+                    libc::IPV6_V6ONLY,
+                    &off as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+
+        let inner = AsyncFd::new(SctpSocket { fd })?;
+
+        let packed = crate::listener::pack_addrs(addrs);
+        let mut assoc_id: i32 = 0;
+        let ret = unsafe {
+            sys::sctp_connectx(
+                inner.as_raw_fd(),
+                packed.as_ptr() as *const libc::sockaddr,
+                addrs.len() as libc::c_int,
+                &mut assoc_id,
+            )
+        };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINPROGRESS) {
+                return Err(SctpError::Io(err));
+            }
+        }
+
+        inner.writable().await?.retain_ready();
+
+        let mut err_val: libc::c_int = 0;
+        let mut err_len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let ret = unsafe {
+            libc::getsockopt(
+                inner.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                &mut err_val as *mut _ as *mut libc::c_void,
+                &mut err_len,
+            )
+        };
+        if ret < 0 {
+            return Err(SctpError::Io(io::Error::last_os_error()));
+        }
+        if err_val != 0 {
+            return Err(SctpError::Io(io::Error::from_raw_os_error(err_val)));
+        }
+
+        Ok(Self { inner })
+    }
+
     /// Send data on a specific stream with a Payload Protocol Identifier.
     pub async fn send(
         &self,

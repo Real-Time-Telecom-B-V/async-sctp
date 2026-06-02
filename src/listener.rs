@@ -98,6 +98,90 @@ impl SctpListener {
         Ok(Self { inner })
     }
 
+    /// Bind a multihomed SCTP listener across one or more local addresses,
+    /// which may mix IPv4 and IPv6. The first address is bound conventionally;
+    /// the rest are added with `sctp_bindx`. A v6 socket is opened with
+    /// `IPV6_V6ONLY=0` so v4 and v6 paths can share the association.
+    pub fn bind_multi(addrs: &[SocketAddr]) -> Result<Self, SctpError> {
+        let primary = *addrs.first().ok_or_else(|| {
+            SctpError::Io(io::Error::new(io::ErrorKind::InvalidInput, "no bind addresses"))
+        })?;
+        let domain = if addrs.iter().any(SocketAddr::is_ipv6) {
+            libc::AF_INET6
+        } else {
+            libc::AF_INET
+        };
+
+        let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, sys::IPPROTO_SCTP) };
+        if fd < 0 {
+            return Err(SctpError::Io(io::Error::last_os_error()));
+        }
+
+        let optval: libc::c_int = 1;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+        if domain == libc::AF_INET6 {
+            // Allow v4 and v6 addresses on the same association.
+            let off: libc::c_int = 0;
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_IPV6,
+                    libc::IPV6_V6ONLY,
+                    &off as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+
+        let (sockaddr, socklen) = socket_addr_to_raw(&primary);
+        if unsafe { libc::bind(fd, &sockaddr as *const _ as *const libc::sockaddr, socklen) } < 0 {
+            let err = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(SctpError::Io(err));
+        }
+
+        if addrs.len() > 1 {
+            let packed = pack_addrs(&addrs[1..]);
+            let ret = unsafe {
+                sys::sctp_bindx(
+                    fd,
+                    packed.as_ptr() as *const libc::sockaddr,
+                    (addrs.len() - 1) as libc::c_int,
+                    sys::SCTP_BINDX_ADD_ADDR,
+                )
+            };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                unsafe { libc::close(fd) };
+                return Err(SctpError::Io(err));
+            }
+        }
+
+        if unsafe { libc::listen(fd, 128) } < 0 {
+            let err = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(SctpError::Io(err));
+        }
+
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            let err = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(SctpError::Io(err));
+        }
+
+        let socket = ListenSocket { fd };
+        Ok(Self { inner: AsyncFd::new(socket)? })
+    }
+
     /// Accept an incoming SCTP association.
     ///
     /// Returns the new association and the peer's address.
@@ -154,6 +238,20 @@ impl SctpListener {
 }
 
 /// Convert a `SocketAddr` to raw sockaddr_storage + length.
+/// Pack a list of socket addresses into the contiguous buffer of raw
+/// sockaddrs that `sctp_bindx`/`sctp_connectx` expect (each entry sized by
+/// its family, so v4 and v6 may be mixed; the kernel reads `sa_family`).
+pub(crate) fn pack_addrs(addrs: &[SocketAddr]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for addr in addrs {
+        let (storage, len) = socket_addr_to_raw(addr);
+        let bytes =
+            unsafe { std::slice::from_raw_parts(&storage as *const _ as *const u8, len as usize) };
+        buf.extend_from_slice(bytes);
+    }
+    buf
+}
+
 fn socket_addr_to_raw(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
 

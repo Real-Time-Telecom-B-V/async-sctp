@@ -16,6 +16,10 @@ pub const SCTP_NODELAY: c_int = 3;
 pub const SCTP_RECVRCVINFO: c_int = 32;
 pub const SCTP_RECVNXTINFO: c_int = 33;
 
+// sctp_bindx() flags
+pub const SCTP_BINDX_ADD_ADDR: c_int = 0x01;
+pub const SCTP_BINDX_REM_ADDR: c_int = 0x02;
+
 // SCTP notification types
 pub const SCTP_SN_TYPE_BASE: u16 = 1 << 15;
 pub const SCTP_ASSOC_CHANGE: u16 = SCTP_SN_TYPE_BASE | 0x0001;
