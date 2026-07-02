@@ -1,5 +1,10 @@
 # async-sctp
 
+[![crates.io](https://img.shields.io/crates/v/async-sctp.svg)](https://crates.io/crates/async-sctp)
+[![docs.rs](https://docs.rs/async-sctp/badge.svg)](https://docs.rs/async-sctp)
+[![CI](https://github.com/Real-Time-Telecom-B-V/async-sctp/actions/workflows/ci.yml/badge.svg)](https://github.com/Real-Time-Telecom-B-V/async-sctp/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **Async SCTP for Rust _and_ Python** — a [tokio](https://tokio.rs) wrapper over
 the Linux kernel SCTP stack (lksctp) that surfaces what a generic socket can't:
 per-message **stream** and **PPID**, **multihoming**, association
