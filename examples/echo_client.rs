@@ -1,41 +1,31 @@
-//! SCTP echo client example.
+//! One-to-one SCTP echo client — sends a line, prints the echo.
 //!
-//! Connects to 127.0.0.1:9999, sends a message on stream 0 with PPID 3 (M3UA),
-//! and prints the echoed response.
-//!
-//! # Usage
-//! ```sh
-//! cargo run --example echo_client
-//! ```
+//! Run: `cargo run --example echo_client -- 127.0.0.1:38412 "hello"`
 
-use sctp::SctpAssociation;
-use std::net::SocketAddr;
+use async_sctp::{ppid, SctpAssociation, SctpConfig};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr: SocketAddr = "127.0.0.1:9999".parse()?;
-    println!("Connecting to {addr}...");
+async fn main() -> Result<(), async_sctp::SctpError> {
+    let addr = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "127.0.0.1:38412".to_string());
+    let msg = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "hello sctp".to_string());
 
-    let assoc = SctpAssociation::connect(addr).await?;
-    println!("Connected!");
+    // Request a healthy number of streams up front.
+    let cfg = SctpConfig::new().streams(16, 16).nodelay(true);
+    let assoc = SctpAssociation::connect_with(addr.parse().expect("valid addr"), &cfg).await?;
+    println!("connected; peer addrs = {:?}", assoc.peer_addrs()?);
 
-    let message = b"Hello, SCTP!";
-    let ppid = 3; // M3UA
-    let stream = 0;
-
-    assoc.send(message, stream, ppid).await?;
-    println!("Sent {} bytes on stream {stream} (ppid={ppid})", message.len());
-
-    let (data, info) = assoc.recv().await?;
+    assoc.send(msg.as_bytes(), 0, ppid::M3UA).await?;
+    let (echo, info) = assoc.recv().await?;
     println!(
-        "Received echo: {:?} on stream {} (ppid={})",
-        String::from_utf8_lossy(&data),
+        "echo on stream {} ({}): {}",
         info.stream,
-        info.ppid
+        ppid::display(info.ppid),
+        String::from_utf8_lossy(&echo)
     );
-
     assoc.shutdown().await?;
-    println!("Shutdown complete");
-
     Ok(())
 }

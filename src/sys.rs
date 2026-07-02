@@ -10,15 +10,26 @@ pub const IPPROTO_SCTP: c_int = 132;
 pub const SOL_SCTP: c_int = 132;
 
 // Socket option constants
+pub const SCTP_RTOINFO: c_int = 0;
 pub const SCTP_INITMSG: c_int = 2;
-pub const SCTP_EVENTS: c_int = 11;
 pub const SCTP_NODELAY: c_int = 3;
+pub const SCTP_AUTOCLOSE: c_int = 4;
+pub const SCTP_PRIMARY_ADDR: c_int = 7;
+pub const SCTP_EVENTS: c_int = 11;
+pub const SCTP_MAXSEG: c_int = 13;
+pub const SCTP_STATUS: c_int = 14;
 pub const SCTP_RECVRCVINFO: c_int = 32;
 pub const SCTP_RECVNXTINFO: c_int = 33;
 
 // sctp_bindx() flags
 pub const SCTP_BINDX_ADD_ADDR: c_int = 0x01;
 pub const SCTP_BINDX_REM_ADDR: c_int = 0x02;
+
+// Per-message send flags (sctp_sndrcvinfo.sinfo_flags; RFC 6458 §5.3.2).
+pub const SCTP_UNORDERED: u32 = 0x0001; // deliver unordered
+pub const SCTP_ADDR_OVER: u32 = 0x0002; // override the primary destination
+pub const SCTP_ABORT: u32 = 0x0004; // abort the association (payload = cause)
+pub const SCTP_EOF: u32 = 0x0200; // initiate graceful shutdown
 
 // SCTP notification types
 pub const SCTP_SN_TYPE_BASE: u16 = 1 << 15;
@@ -164,19 +175,31 @@ extern "C" {
         msg_flags: *mut c_int,
     ) -> c_int;
 
-    pub fn sctp_bindx(
+    pub fn sctp_bindx(sd: c_int, addrs: *const sockaddr, addrcnt: c_int, flags: c_int) -> c_int;
+
+    pub fn sctp_connectx(sd: c_int, addrs: *const sockaddr, addrcnt: c_int, id: *mut i32) -> c_int;
+
+    /// Send on a one-to-many socket to a specific association via `sinfo`.
+    pub fn sctp_send(
         sd: c_int,
-        addrs: *const sockaddr,
-        addrcnt: c_int,
+        msg: *const c_void,
+        len: size_t,
+        sinfo: *const SctpSndRcvInfo,
         flags: c_int,
     ) -> c_int;
 
-    pub fn sctp_connectx(
-        sd: c_int,
-        addrs: *const sockaddr,
-        addrcnt: c_int,
-        id: *mut i32,
-    ) -> c_int;
+    /// Branch an association off a one-to-many socket into its own fd.
+    pub fn sctp_peeloff(sd: c_int, assoc_id: i32) -> c_int;
+
+    /// Retrieve the peer (remote) addresses of an association. Caller frees with
+    /// `sctp_freepaddrs`.
+    pub fn sctp_getpaddrs(sd: c_int, id: i32, addrs: *mut *mut sockaddr) -> c_int;
+    pub fn sctp_freepaddrs(addrs: *mut sockaddr);
+
+    /// Retrieve the local addresses of an association. Caller frees with
+    /// `sctp_freeladdrs`.
+    pub fn sctp_getladdrs(sd: c_int, id: i32, addrs: *mut *mut sockaddr) -> c_int;
+    pub fn sctp_freeladdrs(addrs: *mut sockaddr);
 }
 
 // Link against libsctp

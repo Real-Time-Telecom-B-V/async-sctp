@@ -1,12 +1,49 @@
 [package]
-name = "sctp"
-version = "0.1.0"
+name = "async-sctp"
+version = "1.0.0"
 edition = "2021"
-description = "Async Rust wrapper around Linux kernel SCTP (lksctp)"
+rust-version = "1.80"
+description = "Async SCTP for Rust and Python — a tokio wrapper over the Linux kernel SCTP stack (lksctp), with multihoming, per-message stream/PPID, one-to-many, and notifications"
+authors = ["Real Time Telecom B.V."]
 license = "MIT"
-repository = "https://github.com/killdashnine/sctp"
+readme = "README.md"
+repository = "https://github.com/Real-Time-Telecom-B-V/async-sctp"
+homepage = "https://github.com/Real-Time-Telecom-B-V/async-sctp"
+keywords = ["sctp", "tokio", "async", "lksctp", "networking"]
+categories = ["network-programming", "asynchronous"]
+# Keep CI/build scaffolding out of the crates.io package. `python/` (the wheel's
+# pure-Python shim) and `pyproject.toml` ship harmlessly; the dev-only test suite
+# under `python/tests/` does not.
+exclude = [".github/", "docs/", "scripts/", "python/tests/"]
+
+# cdylib → maturin/PyO3 build the loadable extension module (the wheel).
+# rlib   → crates.io consumers link this; the cdylib is inert for them.
+[lib]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 libc = "0.2"
 tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "macros", "io-util"] }
 thiserror = "2"
+
+# Optional Python bindings (feature = "python"). Kept out of the default build so
+# `cargo add async-sctp` and crates.io consumers pull ZERO pyo3. The async surface
+# bridges tokio↔asyncio via pyo3-async-runtimes. pyo3 >= 0.28 defaults modules to
+# `gil_used = false`, so the extension loads on free-threaded CPython.
+pyo3 = { version = "0.29", optional = true, features = ["abi3-py39"] }
+pyo3-async-runtimes = { version = "0.29", optional = true, features = ["tokio-runtime"] }
+
+[features]
+default = []
+# Links libpython; enables the bindings. Used by `cargo {test,clippy} --features python`.
+python = ["dep:pyo3", "dep:pyo3-async-runtimes"]
+# Wheel-only: maturin sets this. `pyo3/extension-module` tells pyo3 NOT to link
+# libpython, which breaks a Rust test binary — so it is NEVER enabled by
+# `cargo test`/`cargo clippy` (and CI must not use `--all-features`).
+extension-module = ["python", "pyo3/extension-module"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }

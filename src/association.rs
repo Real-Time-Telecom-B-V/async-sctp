@@ -4,20 +4,24 @@ use std::os::unix::io::{AsRawFd, RawFd};
 
 use tokio::io::unix::AsyncFd;
 
+use crate::addr;
+use crate::config::SctpConfig;
 use crate::error::SctpError;
 use crate::notification::{self, Notification};
 use crate::sys;
 use crate::types::RecvInfo;
 
-/// An SCTP association (connection) wrapping a kernel SCTP socket.
+/// An SCTP association (a one-to-one connection) wrapping a kernel SCTP socket.
 ///
-/// Provides async send/recv over a one-to-one style SCTP socket.
+/// Obtain one from [`SctpListener::accept`](crate::SctpListener::accept),
+/// [`connect`](Self::connect), or by peeling one off a
+/// [`SctpServer`](crate::SctpServer).
 pub struct SctpAssociation {
     inner: AsyncFd<SctpSocket>,
 }
 
-/// Wrapper around a raw file descriptor for the SCTP socket.
-struct SctpSocket {
+/// Owns the socket fd and closes it on drop.
+pub(crate) struct SctpSocket {
     fd: RawFd,
 }
 
@@ -35,81 +39,86 @@ impl Drop for SctpSocket {
     }
 }
 
+/// Per-message send options. Default = reliable, ordered delivery.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SendOptions {
+    /// Deliver this message unordered (`SCTP_UNORDERED`).
+    pub unordered: bool,
+    /// PR-SCTP timed reliability: discard the message if it can't be delivered
+    /// within this many milliseconds (0 = fully reliable, the default).
+    pub ttl_ms: u32,
+    /// Send an ABORT for the association (the payload becomes the abort cause).
+    pub abort: bool,
+    /// Initiate a graceful shutdown after this message (`SCTP_EOF`).
+    pub eof: bool,
+}
+
+impl SendOptions {
+    /// Reliable, ordered (the default).
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Deliver unordered.
+    pub fn unordered(mut self, v: bool) -> Self {
+        self.unordered = v;
+        self
+    }
+    /// PR-SCTP timed reliability (discard after `ms` milliseconds; 0 = reliable).
+    pub fn ttl_ms(mut self, ms: u32) -> Self {
+        self.ttl_ms = ms;
+        self
+    }
+
+    pub(crate) fn sinfo_flags(&self) -> u32 {
+        let mut f = 0;
+        if self.unordered {
+            f |= sys::SCTP_UNORDERED;
+        }
+        if self.abort {
+            f |= sys::SCTP_ABORT;
+        }
+        if self.eof {
+            f |= sys::SCTP_EOF;
+        }
+        f
+    }
+}
+
 impl SctpAssociation {
-    /// Create an `SctpAssociation` from an already-connected raw file descriptor.
-    ///
-    /// The fd is set to non-blocking mode and wrapped in tokio's `AsyncFd`.
+    /// Wrap an already-connected raw fd (from `accept`/`peeloff`), set it
+    /// non-blocking, subscribe to events, and register it with tokio.
     pub(crate) fn from_raw_fd(fd: RawFd) -> Result<Self, SctpError> {
         set_nonblocking(fd)?;
         configure_events(fd)?;
-        let socket = SctpSocket { fd };
-        let inner = AsyncFd::new(socket)?;
+        let inner = AsyncFd::new(SctpSocket { fd })?;
         Ok(Self { inner })
     }
 
-    /// Connect to a remote SCTP endpoint.
+    /// Connect to a remote SCTP endpoint (kernel defaults).
     pub async fn connect(addr: SocketAddr) -> Result<Self, SctpError> {
-        let domain = match addr {
-            SocketAddr::V4(_) => libc::AF_INET,
-            SocketAddr::V6(_) => libc::AF_INET6,
-        };
-
-        let fd = unsafe {
-            libc::socket(domain, libc::SOCK_STREAM, sys::IPPROTO_SCTP)
-        };
-        if fd < 0 {
-            return Err(SctpError::Io(io::Error::last_os_error()));
-        }
-
-        set_nonblocking(fd)?;
-        configure_events(fd)?;
-
-        let socket = SctpSocket { fd };
-        let inner = AsyncFd::new(socket)?;
-
-        // Initiate non-blocking connect
-        let (sockaddr, socklen) = socket_addr_to_raw(&addr);
-        let ret = unsafe {
-            libc::connect(inner.as_raw_fd(), &sockaddr as *const _ as *const libc::sockaddr, socklen)
-        };
-
-        if ret < 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() != Some(libc::EINPROGRESS) {
-                return Err(SctpError::Io(err));
-            }
-        }
-
-        // Wait for connect to complete
-        inner.writable().await?.retain_ready();
-
-        // Check for connect error
-        let mut err_val: libc::c_int = 0;
-        let mut err_len: libc::socklen_t =
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        let ret = unsafe {
-            libc::getsockopt(
-                inner.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_ERROR,
-                &mut err_val as *mut _ as *mut libc::c_void,
-                &mut err_len,
-            )
-        };
-        if ret < 0 {
-            return Err(SctpError::Io(io::Error::last_os_error()));
-        }
-        if err_val != 0 {
-            return Err(SctpError::Io(io::Error::from_raw_os_error(err_val)));
-        }
-
-        Ok(Self { inner })
+        Self::connect_impl(&[addr], &SctpConfig::default()).await
     }
 
-    /// Connect to a multihomed peer across one or more remote addresses,
-    /// which may mix IPv4 and IPv6, using `sctp_connectx`. The local socket
-    /// family follows the address set (v6 with `IPV6_V6ONLY=0` if any v6).
+    /// Connect with an explicit [`SctpConfig`] (stream counts, sockopts).
+    pub async fn connect_with(addr: SocketAddr, config: &SctpConfig) -> Result<Self, SctpError> {
+        Self::connect_impl(&[addr], config).await
+    }
+
+    /// Connect to a multihomed peer across several addresses (`sctp_connectx`),
+    /// which may mix IPv4 and IPv6.
     pub async fn connect_multi(addrs: &[SocketAddr]) -> Result<Self, SctpError> {
+        Self::connect_impl(addrs, &SctpConfig::default()).await
+    }
+
+    /// Multihomed connect with an explicit [`SctpConfig`].
+    pub async fn connect_multi_with(
+        addrs: &[SocketAddr],
+        config: &SctpConfig,
+    ) -> Result<Self, SctpError> {
+        Self::connect_impl(addrs, config).await
+    }
+
+    async fn connect_impl(addrs: &[SocketAddr], config: &SctpConfig) -> Result<Self, SctpError> {
         if addrs.is_empty() {
             return Err(SctpError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -126,24 +135,20 @@ impl SctpAssociation {
         if fd < 0 {
             return Err(SctpError::Io(io::Error::last_os_error()));
         }
+        // From here on, close the fd on any early return.
+        let guard = FdGuard(fd);
+
         set_nonblocking(fd)?;
-        configure_events(fd)?;
         if domain == libc::AF_INET6 {
-            let off: libc::c_int = 0;
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_IPV6,
-                    libc::IPV6_V6ONLY,
-                    &off as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-            }
+            set_v6only(fd, false);
         }
+        config.apply(fd)?;
+        configure_events(fd)?;
 
         let inner = AsyncFd::new(SctpSocket { fd })?;
+        guard.disarm(); // ownership moved into SctpSocket
 
-        let packed = crate::listener::pack_addrs(addrs);
+        let packed = addr::pack(addrs);
         let mut assoc_id: i32 = 0;
         let ret = unsafe {
             sys::sctp_connectx(
@@ -161,38 +166,26 @@ impl SctpAssociation {
         }
 
         inner.writable().await?.retain_ready();
-
-        let mut err_val: libc::c_int = 0;
-        let mut err_len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        let ret = unsafe {
-            libc::getsockopt(
-                inner.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_ERROR,
-                &mut err_val as *mut _ as *mut libc::c_void,
-                &mut err_len,
-            )
-        };
-        if ret < 0 {
-            return Err(SctpError::Io(io::Error::last_os_error()));
-        }
-        if err_val != 0 {
-            return Err(SctpError::Io(io::Error::from_raw_os_error(err_val)));
-        }
-
+        check_so_error(inner.as_raw_fd())?;
         Ok(Self { inner })
     }
 
-    /// Send data on a specific stream with a Payload Protocol Identifier.
-    pub async fn send(
+    /// Send `data` on `stream` with the given `ppid`, reliable + ordered.
+    pub async fn send(&self, data: &[u8], stream: u16, ppid: u32) -> Result<usize, SctpError> {
+        self.send_with(data, stream, ppid, &SendOptions::default())
+            .await
+    }
+
+    /// Send with explicit [`SendOptions`] (unordered / PR-SCTP / abort / eof).
+    pub async fn send_with(
         &self,
         data: &[u8],
         stream: u16,
         ppid: u32,
+        opts: &SendOptions,
     ) -> Result<usize, SctpError> {
         loop {
             let mut guard = self.inner.writable().await?;
-
             let ret = unsafe {
                 sys::sctp_sendmsg(
                     self.inner.as_raw_fd(),
@@ -200,14 +193,13 @@ impl SctpAssociation {
                     data.len(),
                     std::ptr::null(),
                     0,
-                    ppid.to_be(), // PPID is in network byte order
-                    0,            // flags
+                    ppid.to_be(), // PPID travels in network byte order
+                    opts.sinfo_flags(),
                     stream,
-                    0, // timetolive
+                    opts.ttl_ms,
                     0, // context
                 )
             };
-
             if ret < 0 {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::WouldBlock {
@@ -216,82 +208,31 @@ impl SctpAssociation {
                 }
                 return Err(SctpError::Io(err));
             }
-
             return Ok(ret as usize);
         }
     }
 
-    /// Receive data, returning the payload and receive info (stream, ppid, etc).
-    ///
-    /// If the received message is an SCTP notification (e.g. association change),
-    /// it is returned as `Err(SctpError::Notification(...))`.
+    /// Receive the next application message, returning the payload and its
+    /// [`RecvInfo`] (stream, ppid, assoc_id). SCTP notifications (COMM_UP,
+    /// COMM_LOST, …) are skipped transparently — use
+    /// [`recv_msg`](Self::recv_msg) if you need to observe them.
     pub async fn recv(&self) -> Result<(Vec<u8>, RecvInfo), SctpError> {
-        let mut buf = vec![0u8; 65536];
-
         loop {
-            let mut guard = self.inner.readable().await?;
-
-            let mut sinfo = sys::SctpSndRcvInfo::default();
-            let mut msg_flags: libc::c_int = 0;
-
-            let ret = unsafe {
-                sys::sctp_recvmsg(
-                    self.inner.as_raw_fd(),
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    &mut sinfo,
-                    &mut msg_flags,
-                )
-            };
-
-            if ret < 0 {
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::WouldBlock {
-                    guard.clear_ready();
-                    continue;
-                }
-                return Err(SctpError::Io(err));
+            match self.recv_msg().await? {
+                RecvResult::Data(data, info) => return Ok((data, info)),
+                RecvResult::Notification(_) => continue,
             }
-
-            if ret == 0 {
-                return Err(SctpError::PeerShutdown);
-            }
-
-            let len = ret as usize;
-
-            // Check if this is a notification
-            if msg_flags & sys::MSG_NOTIFICATION != 0 {
-                let notif = notification::parse_notification(&buf[..len]);
-                return Err(SctpError::Notification(format!("{notif}")));
-            }
-
-            buf.truncate(len);
-
-            let info = RecvInfo {
-                stream: sinfo.sinfo_stream,
-                ppid: u32::from_be(sinfo.sinfo_ppid), // PPID from network byte order
-                assoc_id: sinfo.sinfo_assoc_id,
-            };
-
-            return Ok((buf, info));
         }
     }
 
-    /// Receive data or a notification.
-    ///
-    /// Unlike `recv()`, this method returns notifications as `Ok(RecvResult::Notification(...))`
-    /// instead of as errors, making it easier to handle both data and notifications.
+    /// Receive either application data or an SCTP notification.
     pub async fn recv_msg(&self) -> Result<RecvResult, SctpError> {
         let mut buf = vec![0u8; 65536];
-
         loop {
             let mut guard = self.inner.readable().await?;
 
             let mut sinfo = sys::SctpSndRcvInfo::default();
             let mut msg_flags: libc::c_int = 0;
-
             let ret = unsafe {
                 sys::sctp_recvmsg(
                     self.inner.as_raw_fd(),
@@ -312,48 +253,62 @@ impl SctpAssociation {
                 }
                 return Err(SctpError::Io(err));
             }
-
             if ret == 0 {
                 return Err(SctpError::PeerShutdown);
             }
 
             let len = ret as usize;
-
             if msg_flags & sys::MSG_NOTIFICATION != 0 {
-                let notif = notification::parse_notification(&buf[..len]);
-                return Ok(RecvResult::Notification(notif));
+                return Ok(RecvResult::Notification(notification::parse_notification(
+                    &buf[..len],
+                )));
             }
-
             buf.truncate(len);
-
             let info = RecvInfo {
                 stream: sinfo.sinfo_stream,
                 ppid: u32::from_be(sinfo.sinfo_ppid),
                 assoc_id: sinfo.sinfo_assoc_id,
             };
-
             return Ok(RecvResult::Data(buf, info));
         }
     }
 
-    /// Gracefully shut down the association.
+    /// The peer (remote) addresses of this association — more than one if the
+    /// peer is multihomed (`sctp_getpaddrs`).
+    pub fn peer_addrs(&self) -> Result<Vec<SocketAddr>, SctpError> {
+        addrs_via(self.inner.as_raw_fd(), 0, true)
+    }
+
+    /// The local addresses bound to this association (`sctp_getladdrs`).
+    pub fn local_addrs(&self) -> Result<Vec<SocketAddr>, SctpError> {
+        addrs_via(self.inner.as_raw_fd(), 0, false)
+    }
+
+    /// Gracefully shut down the association (SCTP SHUTDOWN handshake).
     pub async fn shutdown(&self) -> Result<(), SctpError> {
-        let ret = unsafe {
-            libc::shutdown(self.inner.as_raw_fd(), libc::SHUT_WR)
-        };
+        let ret = unsafe { libc::shutdown(self.inner.as_raw_fd(), libc::SHUT_WR) };
         if ret < 0 {
             return Err(SctpError::Io(io::Error::last_os_error()));
         }
         Ok(())
     }
 
-    /// Returns the raw file descriptor of the underlying socket.
+    /// Abort the association immediately (SCTP ABORT, no shutdown handshake).
+    pub async fn abort(&self) -> Result<(), SctpError> {
+        let opts = SendOptions {
+            abort: true,
+            ..Default::default()
+        };
+        self.send_with(&[], 0, 0, &opts).await.map(|_| ())
+    }
+
+    /// The raw file descriptor of the underlying socket.
     pub fn as_raw_fd(&self) -> RawFd {
         self.inner.as_raw_fd()
     }
 }
 
-/// Result of receiving a message, which can be either data or a notification.
+/// Result of receiving on an association: application data or a notification.
 #[derive(Debug)]
 pub enum RecvResult {
     /// Application data with receive info.
@@ -362,21 +317,51 @@ pub enum RecvResult {
     Notification(Notification),
 }
 
-/// Set a file descriptor to non-blocking mode.
-fn set_nonblocking(fd: RawFd) -> Result<(), SctpError> {
+// ── shared fd helpers ───────────────────────────────────────────────────────
+
+/// Closes a raw fd on drop unless disarmed — for cleanup on the error paths
+/// between `socket()` and handing the fd to an owner.
+struct FdGuard(RawFd);
+impl FdGuard {
+    fn disarm(mut self) {
+        self.0 = -1;
+        std::mem::forget(self);
+    }
+}
+impl Drop for FdGuard {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            unsafe { libc::close(self.0) };
+        }
+    }
+}
+
+pub(crate) fn set_nonblocking(fd: RawFd) -> Result<(), SctpError> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
         return Err(SctpError::Io(io::Error::last_os_error()));
     }
-    let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-    if ret < 0 {
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(SctpError::Io(io::Error::last_os_error()));
     }
     Ok(())
 }
 
-/// Configure SCTP event subscriptions on a socket.
-fn configure_events(fd: RawFd) -> Result<(), SctpError> {
+pub(crate) fn set_v6only(fd: RawFd, on: bool) {
+    let v: libc::c_int = on as libc::c_int;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            &v as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
+/// Subscribe to the SCTP events we surface as notifications.
+pub(crate) fn configure_events(fd: RawFd) -> Result<(), SctpError> {
     let events = sys::SctpEventSubscribe::default();
     let ret = unsafe {
         libc::setsockopt(
@@ -393,26 +378,47 @@ fn configure_events(fd: RawFd) -> Result<(), SctpError> {
     Ok(())
 }
 
-/// Convert a `SocketAddr` to a raw `libc::sockaddr_storage` and length.
-fn socket_addr_to_raw(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+pub(crate) fn check_so_error(fd: RawFd) -> Result<(), SctpError> {
+    let mut err_val: libc::c_int = 0;
+    let mut err_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            &mut err_val as *mut _ as *mut libc::c_void,
+            &mut err_len,
+        )
+    };
+    if ret < 0 {
+        return Err(SctpError::Io(io::Error::last_os_error()));
+    }
+    if err_val != 0 {
+        return Err(SctpError::Io(io::Error::from_raw_os_error(err_val)));
+    }
+    Ok(())
+}
 
-    match addr {
-        SocketAddr::V4(v4) => {
-            let sin = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in) };
-            sin.sin_family = libc::AF_INET as libc::sa_family_t;
-            sin.sin_port = v4.port().to_be();
-            sin.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
-            (storage, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t)
+/// Shared getpaddrs/getladdrs → `Vec<SocketAddr>`.
+fn addrs_via(fd: RawFd, assoc_id: i32, peer: bool) -> Result<Vec<SocketAddr>, SctpError> {
+    let mut ptr: *mut libc::sockaddr = std::ptr::null_mut();
+    let n = unsafe {
+        if peer {
+            sys::sctp_getpaddrs(fd, assoc_id, &mut ptr)
+        } else {
+            sys::sctp_getladdrs(fd, assoc_id, &mut ptr)
         }
-        SocketAddr::V6(v6) => {
-            let sin6 = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in6) };
-            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-            sin6.sin6_port = v6.port().to_be();
-            sin6.sin6_addr.s6_addr = v6.ip().octets();
-            sin6.sin6_flowinfo = v6.flowinfo();
-            sin6.sin6_scope_id = v6.scope_id();
-            (storage, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t)
+    };
+    if n < 0 {
+        return Err(SctpError::Io(io::Error::last_os_error()));
+    }
+    let out = unsafe { addr::parse_array(ptr, n) };
+    unsafe {
+        if peer {
+            sys::sctp_freepaddrs(ptr);
+        } else {
+            sys::sctp_freeladdrs(ptr);
         }
     }
+    Ok(out)
 }

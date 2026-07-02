@@ -1,0 +1,126 @@
+# .github/workflows/ci.yml — async-sctp CI
+#
+# Two stories from one source tree:
+#   * Rust crate (crates.io): default build is pyo3-free.
+#   * Python wheel (PyPI):    the `python` feature adds the PyO3 bindings.
+#
+# IMPORTANT: never use `--all-features`. That would enable `extension-module`,
+# which tells pyo3 NOT to link libpython and so breaks any Rust test binary.
+# `extension-module` is set only by maturin (the wheel build). We test the
+# pyo3-free default AND `--features python` (which links libpython) separately.
+#
+# LINUX-ONLY: this crate wraps the Linux kernel SCTP stack (lksctp). It links
+# `-lsctp`, so even `cargo build`/`clippy` need libsctp-dev present; the tests
+# open real SCTP loopback sockets, so the `sctp` kernel module must be loaded.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # libpython for the `--features python` build/link (abi3 still links libpython
+      # for a non-extension-module test binary).
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # The crate links -lsctp (needs libsctp-dev to build/clippy), and the tests
+      # open real SCTP loopback sockets (need the kernel module loaded).
+      - name: Install libsctp + load module
+        run: sudo apt-get update && sudo apt-get install -y libsctp-dev lksctp-tools && sudo modprobe sctp
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      # Lint both faces of the crate. Clippy honours [lints.clippy] in Cargo.toml
+      # (correctness denied; style/dead-code warn).
+      - name: Clippy (pyo3-free)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (python feature)
+        run: cargo clippy --features python --lib -- -D warnings
+
+      - name: Test (pyo3-free)
+        run: cargo test
+
+      - name: Test (python feature)
+        run: cargo test --features python
+
+      # Deterministic counting-allocator leak gate (pyo3-free).
+      - name: Memory-leak check
+        run: cargo run --release --example leak_check
+
+  # Build the wheel and run the Python parity suite.
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install libsctp + load module
+        run: sudo apt-get update && sudo apt-get install -y libsctp-dev lksctp-tools && sudo modprobe sctp
+
+      - name: Build extension (maturin develop)
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install maturin pytest pytest-asyncio
+          maturin develop
+
+      - name: Import smoke
+        run: . .venv/bin/activate && python -c "import async_sctp; print(async_sctp.__version__)"
+
+      - name: pytest
+        run: . .venv/bin/activate && pytest python/tests -q -o asyncio_mode=auto
+
+  # Free-threaded ("no-GIL") smoke. pyo3 >= 0.28 declares gil_used=false, so the
+  # module must import and run without re-enabling the GIL.
+  # Allowed to fail for now (toolchain availability), but exercises the no-GIL path.
+  python-freethreaded:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14t"
+
+      - name: Install libsctp + load module
+        run: sudo apt-get update && sudo apt-get install -y libsctp-dev lksctp-tools && sudo modprobe sctp
+
+      - name: Build + test on free-threaded CPython
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install maturin pytest pytest-asyncio
+          maturin develop --release
+          python -c "import sys, async_sctp; assert sys._is_gil_enabled() is False; print('no-GIL OK', async_sctp.__version__)"
+          pytest python/tests -q -o asyncio_mode=auto

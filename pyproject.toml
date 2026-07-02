@@ -1,0 +1,36 @@
+# Maturin build config for the `async-sctp` wheel. The version is single-sourced
+# from Cargo.toml (`dynamic = ["version"]`). `extension-module` is enabled only
+# here — never by `cargo test`/`cargo clippy` (it un-links libpython).
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "async-sctp"
+description = "Rust-backed async SCTP for Python — kernel lksctp with multihoming, per-message stream/PPID, one-to-many, and notifications"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Real Time Telecom B.V." }]
+keywords = ["sctp", "asyncio", "async", "lksctp", "networking"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Telecommunications Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: Free Threading :: 3 - Stable",
+    "Topic :: System :: Networking",
+    "Framework :: AsyncIO",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/Real-Time-Telecom-B-V/async-sctp"
+Repository = "https://github.com/Real-Time-Telecom-B-V/async-sctp"
+
+[tool.maturin]
+module-name = "async_sctp._async_sctp"
+python-source = "python"
+features = ["extension-module"]

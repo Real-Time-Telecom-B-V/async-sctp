@@ -99,8 +99,7 @@ pub fn parse_notification(buf: &[u8]) -> Notification {
     match sn_type {
         sys::SCTP_ASSOC_CHANGE => {
             if buf.len() >= std::mem::size_of::<sys::SctpAssocChange>() {
-                let sac =
-                    unsafe { &*(buf.as_ptr() as *const sys::SctpAssocChange) };
+                let sac = unsafe { &*(buf.as_ptr() as *const sys::SctpAssocChange) };
                 Notification::AssocChange(AssocChangeEvent {
                     state: AssocChangeState::from(sac.sac_state),
                     error: sac.sac_error,
@@ -114,8 +113,7 @@ pub fn parse_notification(buf: &[u8]) -> Notification {
         }
         sys::SCTP_SHUTDOWN_EVENT => {
             if buf.len() >= std::mem::size_of::<sys::SctpShutdownEvent>() {
-                let sse =
-                    unsafe { &*(buf.as_ptr() as *const sys::SctpShutdownEvent) };
+                let sse = unsafe { &*(buf.as_ptr() as *const sys::SctpShutdownEvent) };
                 Notification::Shutdown {
                     assoc_id: sse.sse_assoc_id,
                 }
