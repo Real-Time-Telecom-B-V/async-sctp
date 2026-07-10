@@ -1,6 +1,6 @@
 //! One-to-many (`SctpServer`) integration tests. Require Linux kernel SCTP.
 
-use async_sctp::{ppid, SctpAssociation, SctpServer, ServerMessage};
+use async_sctp::{ppid, SctpAssociation, SctpConfig, SctpServer, ServerMessage};
 
 /// Read the next data message on the server, skipping notifications.
 async fn server_data(srv: &SctpServer) -> (Vec<u8>, i32, u16, u32) {
@@ -41,6 +41,28 @@ async fn server_serves_many_and_echoes_by_assoc() {
     let (eb, _) = b.recv().await.unwrap();
     assert_eq!(ea, b"from-a");
     assert_eq!(eb, b"from-b");
+}
+
+#[tokio::test]
+async fn server_reassembles_large_message() {
+    // The one-to-many socket must also reassemble a message that spans more than
+    // one sctp_recvmsg (bigger than the 64 KiB internal window) before returning it.
+    // Buffers are sized up so a whole 256 KiB message fits in SO_SNDBUF/SO_RCVBUF.
+    let cfg = SctpConfig::new().send_buf(1 << 20).recv_buf(1 << 20);
+    let server = SctpServer::bind_config("127.0.0.1:0".parse().unwrap(), &cfg).unwrap();
+    let bound = server.local_addr().unwrap();
+
+    let client = SctpAssociation::connect_with(bound, &cfg).await.unwrap();
+    let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+    client.send(&payload, 4, ppid::M3UA).await.unwrap();
+
+    let (data, assoc_id, stream, pp) = server_data(&server).await;
+    assert_eq!(data.len(), payload.len(), "reassembled length");
+    assert_eq!(data, payload, "reassembled bytes");
+    server.send(assoc_id, &data, stream, pp).await.unwrap();
+
+    let (echo, _) = client.recv().await.unwrap();
+    assert_eq!(echo, payload);
 }
 
 #[tokio::test]
