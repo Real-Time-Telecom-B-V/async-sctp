@@ -1,13 +1,15 @@
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::Mutex;
 
 use tokio::io::unix::AsyncFd;
 
 use crate::addr;
 use crate::config::SctpConfig;
 use crate::error::SctpError;
-use crate::notification::{self, Notification};
+use crate::notification::Notification;
+use crate::recv::{Reassembly, Step};
 use crate::sys;
 use crate::types::RecvInfo;
 
@@ -18,6 +20,9 @@ use crate::types::RecvInfo;
 /// [`SctpServer`](crate::SctpServer).
 pub struct SctpAssociation {
     inner: AsyncFd<SctpSocket>,
+    /// Cross-call reassembly buffer so `recv`/`recv_msg` accumulate a partially
+    /// delivered message until `MSG_EOR` and stay cancel-safe (see [`crate::recv`]).
+    recv_state: Mutex<Reassembly>,
 }
 
 /// Owns the socket fd and closes it on drop.
@@ -91,7 +96,10 @@ impl SctpAssociation {
         set_nonblocking(fd)?;
         configure_events(fd)?;
         let inner = AsyncFd::new(SctpSocket { fd })?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            recv_state: Mutex::new(Reassembly::default()),
+        })
     }
 
     /// Connect to a remote SCTP endpoint (kernel defaults).
@@ -167,10 +175,18 @@ impl SctpAssociation {
 
         inner.writable().await?.retain_ready();
         check_so_error(inner.as_raw_fd())?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            recv_state: Mutex::new(Reassembly::default()),
+        })
     }
 
     /// Send `data` on `stream` with the given `ppid`, reliable + ordered.
+    ///
+    /// SCTP is message-oriented, so a message is sent whole or not at all: there is
+    /// no partial send. A message larger than the socket send buffer fails with
+    /// `EMSGSIZE` rather than being truncated, so raise it with
+    /// [`SctpConfig::send_buf`] when a message can exceed the kernel default.
     pub async fn send(&self, data: &[u8], stream: u16, ppid: u32) -> Result<usize, SctpError> {
         self.send_with(data, stream, ppid, &SendOptions::default())
             .await
@@ -212,10 +228,17 @@ impl SctpAssociation {
         }
     }
 
-    /// Receive the next application message, returning the payload and its
-    /// [`RecvInfo`] (stream, ppid, assoc_id). SCTP notifications (COMM_UP,
-    /// COMM_LOST, …) are skipped transparently — use
+    /// Receive the next *complete* application message, returning the payload and
+    /// its [`RecvInfo`] (stream, ppid, assoc_id). A message fragmented across more
+    /// than one `sctp_recvmsg` is reassembled internally (accumulated until
+    /// `MSG_EOR`), so the caller always gets whole messages. SCTP notifications
+    /// (COMM_UP, COMM_LOST, …) are skipped transparently — use
     /// [`recv_msg`](Self::recv_msg) if you need to observe them.
+    ///
+    /// Reassembling a large message spans several syscalls across `await`, but the
+    /// accumulator lives in the association, so `recv` is cancel-safe: a future
+    /// dropped mid-reassembly (e.g. it lost a `tokio::select!` race) leaves the
+    /// leading fragment buffered and the next `recv` resumes it.
     pub async fn recv(&self) -> Result<(Vec<u8>, RecvInfo), SctpError> {
         loop {
             match self.recv_msg().await? {
@@ -225,51 +248,37 @@ impl SctpAssociation {
         }
     }
 
-    /// Receive either application data or an SCTP notification.
+    /// Receive either a complete application message or an SCTP notification. Like
+    /// [`recv`](Self::recv), a fragmented data message is reassembled until
+    /// `MSG_EOR` before it is returned; a notification that interleaves between two
+    /// fragments is returned as its own [`RecvResult::Notification`] without losing
+    /// the partially accumulated data (the next call continues it).
     pub async fn recv_msg(&self) -> Result<RecvResult, SctpError> {
-        let mut buf = vec![0u8; 65536];
         loop {
             let mut guard = self.inner.readable().await?;
 
-            let mut sinfo = sys::SctpSndRcvInfo::default();
-            let mut msg_flags: libc::c_int = 0;
-            let ret = unsafe {
-                sys::sctp_recvmsg(
-                    self.inner.as_raw_fd(),
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    &mut sinfo,
-                    &mut msg_flags,
-                )
+            // Do one syscall + accumulate under the lock, but never hold the lock
+            // across an `await`: the only cancel point is `readable()` above, where
+            // committed fragments already live in `recv_state`.
+            let step = {
+                let mut state = self
+                    .recv_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.recv_step(self.inner.as_raw_fd(), false)
             };
 
-            if ret < 0 {
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::WouldBlock {
+            match step {
+                Step::WouldBlock => {
                     guard.clear_ready();
                     continue;
                 }
-                return Err(SctpError::Io(err));
+                // Fragment committed; keep the retained readiness and read the next.
+                Step::More => continue,
+                Step::Notification(n) => return Ok(RecvResult::Notification(n)),
+                Step::Complete(data, info, _addr) => return Ok(RecvResult::Data(data, info)),
+                Step::Err(e) => return Err(e),
             }
-            if ret == 0 {
-                return Err(SctpError::PeerShutdown);
-            }
-
-            let len = ret as usize;
-            if msg_flags & sys::MSG_NOTIFICATION != 0 {
-                return Ok(RecvResult::Notification(notification::parse_notification(
-                    &buf[..len],
-                )));
-            }
-            buf.truncate(len);
-            let info = RecvInfo {
-                stream: sinfo.sinfo_stream,
-                ppid: u32::from_be(sinfo.sinfo_ppid),
-                assoc_id: sinfo.sinfo_assoc_id,
-            };
-            return Ok(RecvResult::Data(buf, info));
         }
     }
 

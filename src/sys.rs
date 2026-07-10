@@ -48,8 +48,10 @@ pub const SCTP_RESTART: u16 = 2;
 pub const SCTP_SHUTDOWN_COMP: u16 = 3;
 pub const SCTP_CANT_STR_ASSOC: u16 = 4;
 
-// MSG_NOTIFICATION flag for recvmsg
-pub const MSG_NOTIFICATION: c_int = 0x8000;
+// recvmsg msg_flags bits (Linux values; defined explicitly rather than trusting
+// libc's per-platform constant).
+pub const MSG_NOTIFICATION: c_int = 0x8000; // payload is an SCTP notification, not data
+pub const MSG_EOR: c_int = 0x80; // this read completes a message (end of record)
 
 /// sctp_initmsg - SCTP initialization parameters.
 #[repr(C)]

@@ -10,6 +10,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::Mutex;
 
 use tokio::io::unix::AsyncFd;
 
@@ -18,12 +19,16 @@ use crate::association::{self, SctpAssociation, SendOptions};
 use crate::config::SctpConfig;
 use crate::error::SctpError;
 use crate::notification::Notification;
+use crate::recv::{Reassembly, Step};
 use crate::sys;
 use crate::types::RecvInfo;
 
 /// A one-to-many SCTP socket. See the [module docs](self).
 pub struct SctpServer {
     inner: AsyncFd<ServerSocket>,
+    /// Cross-call reassembly buffer so `recv` accumulates a partially delivered
+    /// message until `MSG_EOR` and stays cancel-safe (see [`crate::recv`]).
+    recv_state: Mutex<Reassembly>,
 }
 
 struct ServerSocket {
@@ -94,7 +99,10 @@ impl SctpServer {
             return Err(SctpError::Io(io::Error::last_os_error()));
         }
         match Self::setup(fd, primary, addrs, domain, config) {
-            Ok(inner) => Ok(Self { inner }),
+            Ok(inner) => Ok(Self {
+                inner,
+                recv_state: Mutex::new(Reassembly::default()),
+            }),
             Err(e) => {
                 unsafe { libc::close(fd) };
                 Err(e)
@@ -152,58 +160,54 @@ impl SctpServer {
         Ok(AsyncFd::new(ServerSocket { fd })?)
     }
 
-    /// Receive the next message from any association (data or notification).
+    /// Receive the next *complete* message from any association (data or
+    /// notification). A data message fragmented across more than one
+    /// `sctp_recvmsg` is reassembled internally (accumulated until `MSG_EOR`), and
+    /// a notification that interleaves between two fragments is returned on its own
+    /// without discarding the partially accumulated data. Cancel-safe: the
+    /// accumulator lives in the socket, so a `recv` dropped mid-reassembly resumes.
     pub async fn recv(&self) -> Result<ServerMessage, SctpError> {
-        let mut buf = vec![0u8; 65536];
         loop {
             let mut guard = self.inner.readable().await?;
 
-            let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-            let mut fromlen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-            let mut sinfo = sys::SctpSndRcvInfo::default();
-            let mut msg_flags: libc::c_int = 0;
-
-            let ret = unsafe {
-                sys::sctp_recvmsg(
-                    self.inner.as_raw_fd(),
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
-                    &mut storage as *mut _ as *mut libc::sockaddr,
-                    &mut fromlen,
-                    &mut sinfo,
-                    &mut msg_flags,
-                )
+            // One syscall + accumulate under the lock, never held across an `await`
+            // (the only cancel point is `readable()` above).
+            let step = {
+                let mut state = self
+                    .recv_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.recv_step(self.inner.as_raw_fd(), true)
             };
-            if ret < 0 {
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::WouldBlock {
+
+            match step {
+                Step::WouldBlock => {
                     guard.clear_ready();
                     continue;
                 }
-                return Err(SctpError::Io(err));
+                Step::More => continue,
+                Step::Notification(n) => return Ok(ServerMessage::Notification(n)),
+                Step::Complete(data, info, addr) => {
+                    // `want_addr` was true, so a data message always carries its
+                    // peer address; the guard is defensive.
+                    let addr = addr.ok_or_else(|| {
+                        SctpError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "sctp: data message without a peer address",
+                        ))
+                    })?;
+                    return Ok(ServerMessage::Data { data, info, addr });
+                }
+                Step::Err(e) => return Err(e),
             }
-            let len = ret as usize;
-            if msg_flags & sys::MSG_NOTIFICATION != 0 {
-                return Ok(ServerMessage::Notification(
-                    crate::notification::parse_notification(&buf[..len]),
-                ));
-            }
-            buf.truncate(len);
-            let info = RecvInfo {
-                stream: sinfo.sinfo_stream,
-                ppid: u32::from_be(sinfo.sinfo_ppid),
-                assoc_id: sinfo.sinfo_assoc_id,
-            };
-            let addr = addr::from_raw(&storage)?;
-            return Ok(ServerMessage::Data {
-                data: buf,
-                info,
-                addr,
-            });
         }
     }
 
     /// Send to a specific association by id, on `stream` with `ppid`.
+    ///
+    /// A message is sent whole or not at all (no partial send); one larger than the
+    /// socket send buffer fails with `EMSGSIZE`, so size it with
+    /// [`SctpConfig::send_buf`] for your largest message.
     pub async fn send(
         &self,
         assoc_id: i32,
