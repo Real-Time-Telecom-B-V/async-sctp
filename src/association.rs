@@ -182,6 +182,11 @@ impl SctpAssociation {
     }
 
     /// Send `data` on `stream` with the given `ppid`, reliable + ordered.
+    ///
+    /// SCTP is message-oriented, so a message is sent whole or not at all: there is
+    /// no partial send. A message larger than the socket send buffer fails with
+    /// `EMSGSIZE` rather than being truncated, so raise it with
+    /// [`SctpConfig::send_buf`] when a message can exceed the kernel default.
     pub async fn send(&self, data: &[u8], stream: u16, ppid: u32) -> Result<usize, SctpError> {
         self.send_with(data, stream, ppid, &SendOptions::default())
             .await

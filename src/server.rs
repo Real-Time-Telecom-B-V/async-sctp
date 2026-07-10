@@ -204,6 +204,10 @@ impl SctpServer {
     }
 
     /// Send to a specific association by id, on `stream` with `ppid`.
+    ///
+    /// A message is sent whole or not at all (no partial send); one larger than the
+    /// socket send buffer fails with `EMSGSIZE`, so size it with
+    /// [`SctpConfig::send_buf`] for your largest message.
     pub async fn send(
         &self,
         assoc_id: i32,
