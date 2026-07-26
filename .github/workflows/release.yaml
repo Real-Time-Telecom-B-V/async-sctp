@@ -118,7 +118,7 @@ jobs:
           - { runner: ubuntu-latest, target: aarch64 }
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       # abi3-py39 (set in Cargo.toml) → one forward-compatible wheel per platform
@@ -153,7 +153,7 @@ jobs:
           - { runner: ubuntu-latest, target: x86_64 }
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.py }}
       - uses: PyO3/maturin-action@v1
