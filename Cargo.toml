@@ -1,6 +1,6 @@
 [package]
 name = "async-sctp"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Async SCTP for Rust and Python — a tokio wrapper over the Linux kernel SCTP stack (lksctp), with multihoming, per-message stream/PPID, one-to-many, and notifications"
@@ -23,7 +23,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 libc = "0.2"
-tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "macros", "io-util"] }
+tokio = { version = "1.32", features = ["net", "rt", "rt-multi-thread", "macros", "io-util", "sync"] }
 thiserror = "2"
 
 # Optional Python bindings (feature = "python"). Kept out of the default build so

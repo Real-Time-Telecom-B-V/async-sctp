@@ -50,7 +50,10 @@ class SctpAssociation:
     async def connect(addr: str, config: SctpConfig | None = None) -> SctpAssociation: ...
     @staticmethod
     async def connect_multi(
-        addrs: list[str], config: SctpConfig | None = None
+        addrs: list[str],
+        config: SctpConfig | None = None,
+        *,
+        local_addrs: list[str] | None = None,
     ) -> SctpAssociation: ...
     async def send(
         self, data: bytes, stream: int, ppid: int, *, unordered: bool = False, ttl_ms: int = 0
