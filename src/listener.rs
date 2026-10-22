@@ -29,6 +29,8 @@ impl AsRawFd for ListenSocket {
     }
 }
 
+impl crate::reactor::OwnsDescriptor for ListenSocket {}
+
 impl Drop for ListenSocket {
     fn drop(&mut self) {
         unsafe {
@@ -120,7 +122,7 @@ impl SctpListener {
             return Err(SctpError::Io(io::Error::last_os_error()));
         }
         association::set_nonblocking(fd)?;
-        Ok(AsyncFd::new(ListenSocket { fd })?)
+        Ok(crate::reactor::register(ListenSocket { fd })?)
     }
 
     /// Accept an incoming association, returning it and the peer's address.

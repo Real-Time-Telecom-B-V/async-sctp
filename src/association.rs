@@ -42,6 +42,8 @@ impl AsRawFd for SctpSocket {
     }
 }
 
+impl crate::reactor::OwnsDescriptor for SctpSocket {}
+
 impl Drop for SctpSocket {
     fn drop(&mut self) {
         unsafe {
@@ -101,7 +103,7 @@ impl SctpAssociation {
     pub(crate) fn from_raw_fd(fd: RawFd) -> Result<Self, SctpError> {
         set_nonblocking(fd)?;
         configure_events(fd)?;
-        let inner = AsyncFd::new(SctpSocket { fd })?;
+        let inner = crate::reactor::register(SctpSocket { fd })?;
         Ok(Self {
             inner,
             recv_state: Mutex::new(Reassembly::default()),
@@ -195,7 +197,7 @@ impl SctpAssociation {
             bind_local(fd, local)?;
         }
 
-        let inner = AsyncFd::new(socket)?;
+        let inner = crate::reactor::register(socket)?;
 
         let packed = addr::pack(addrs);
         let mut assoc_id: i32 = 0;

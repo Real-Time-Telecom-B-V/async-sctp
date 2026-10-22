@@ -16,6 +16,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See
   port. Port `0` leaves the port to the kernel. Python: the keyword
   `local_addrs` of `SctpAssociation.connect_multi`.
 
+### Changed
+- Needs tokio 1.53.3. A socket is registered with the runtime through
+  `AsyncFd::register`, which tokio 1.53.3 introduced in place of `AsyncFd::new`
+  (deprecated there as unsound without I/O safety). Each socket owns its
+  descriptor and closes it only after the registration is gone.
+
 ### Fixed
 - A connect that failed could wait forever. A refused association (the far end
   answers the INIT with an ABORT) or an INIT that is given up sets the socket

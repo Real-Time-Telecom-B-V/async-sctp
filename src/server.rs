@@ -39,6 +39,8 @@ impl AsRawFd for ServerSocket {
         self.fd
     }
 }
+impl crate::reactor::OwnsDescriptor for ServerSocket {}
+
 impl Drop for ServerSocket {
     fn drop(&mut self) {
         unsafe {
@@ -157,7 +159,7 @@ impl SctpServer {
             return Err(SctpError::Io(io::Error::last_os_error()));
         }
         association::set_nonblocking(fd)?;
-        Ok(AsyncFd::new(ServerSocket { fd })?)
+        Ok(crate::reactor::register(ServerSocket { fd })?)
     }
 
     /// Receive the next *complete* message from any association (data or
