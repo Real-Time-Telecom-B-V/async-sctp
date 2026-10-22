@@ -39,7 +39,7 @@ loaded, but it inherits the kernel's mature, RFC-compliant SCTP.
 
 - **One-to-one:** `SctpListener::{bind, bind_config, bind_multi, bind_multi_with,
   accept, local_addr}`; `SctpAssociation::{connect, connect_with, connect_multi,
-  connect_multi_with, send, send_with, recv, recv_msg, peer_addrs, local_addrs,
+  connect_multi_with, connect_from, send, send_with, recv, recv_msg, peer_addrs, local_addrs,
   shutdown, abort}`.
 - **One-to-many:** `SctpServer::{bind, bind_config, bind_multi, bind_multi_with,
   recv, send, send_with, peeloff, local_addr}`; `ServerMessage`.

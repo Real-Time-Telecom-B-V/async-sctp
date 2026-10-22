@@ -175,19 +175,23 @@ impl PyAssociation {
         })
     }
 
-    /// `await SctpAssociation.connect_multi([addr, ...], config=None)`.
+    /// `await SctpAssociation.connect_multi([addr, ...], config=None, *, local_addrs=None)`.
+    /// With `local_addrs` the socket is bound to those addresses (one port
+    /// for all, `0` for any) before it connects.
     #[staticmethod]
-    #[pyo3(signature = (addrs, config=None))]
+    #[pyo3(signature = (addrs, config=None, *, local_addrs=None))]
     fn connect_multi<'py>(
         py: Python<'py>,
         addrs: Vec<String>,
         config: Option<PyConfig>,
+        local_addrs: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         init_runtime();
         let sas = parse_addrs(&addrs)?;
+        let local = parse_addrs(&local_addrs.unwrap_or_default())?;
         let cfg = config.map(|c| c.inner).unwrap_or_default();
         future_into_py(py, async move {
-            let a = SctpAssociation::connect_multi_with(&sas, &cfg)
+            let a = SctpAssociation::connect_from(&local, &sas, &cfg)
                 .await
                 .map_err(err)?;
             Python::attach(|py| Py::new(py, PyAssociation { inner: Arc::new(a) }))

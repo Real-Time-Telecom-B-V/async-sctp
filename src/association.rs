@@ -4,11 +4,13 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Mutex;
 
 use tokio::io::unix::AsyncFd;
+use tokio::io::Interest;
+use tokio::sync::Semaphore;
 
 use crate::addr;
 use crate::config::SctpConfig;
 use crate::error::SctpError;
-use crate::notification::Notification;
+use crate::notification::{AssocChangeState, Notification};
 use crate::recv::{Reassembly, Step};
 use crate::sys;
 use crate::types::RecvInfo;
@@ -23,6 +25,10 @@ pub struct SctpAssociation {
     /// Cross-call reassembly buffer so `recv`/`recv_msg` accumulate a partially
     /// delivered message until `MSG_EOR` and stay cancel-safe (see [`crate::recv`]).
     recv_state: Mutex<Reassembly>,
+    /// Closed once the kernel said the association is over (see [`ends`]): a
+    /// send that waits for room is woken by it, and a receive that finds
+    /// nothing queued does not wait.
+    ended: Semaphore,
 }
 
 /// Owns the socket fd and closes it on drop.
@@ -99,6 +105,7 @@ impl SctpAssociation {
         Ok(Self {
             inner,
             recv_state: Mutex::new(Reassembly::default()),
+            ended: Semaphore::new(0),
         })
     }
 
@@ -126,14 +133,46 @@ impl SctpAssociation {
         Self::connect_impl(addrs, config).await
     }
 
+    /// Connect from chosen local addresses: the socket is bound to `local`
+    /// (`bind`, then `sctp_bindx` for the further addresses of a multihomed
+    /// endpoint) before `sctp_connectx` to `peer`. Every entry of `local`
+    /// carries the same port; port `0` leaves the choice to the kernel. A peer
+    /// that identifies this endpoint by its addresses and port sees exactly
+    /// these: an unbound socket offers every address of the host.
+    ///
+    /// An empty `local` is the same as
+    /// [`connect_multi_with`](Self::connect_multi_with).
+    pub async fn connect_from(
+        local: &[SocketAddr],
+        peer: &[SocketAddr],
+        config: &SctpConfig,
+    ) -> Result<Self, SctpError> {
+        Self::connect_bound(local, peer, config).await
+    }
+
     async fn connect_impl(addrs: &[SocketAddr], config: &SctpConfig) -> Result<Self, SctpError> {
+        Self::connect_bound(&[], addrs, config).await
+    }
+
+    async fn connect_bound(
+        local: &[SocketAddr],
+        addrs: &[SocketAddr],
+        config: &SctpConfig,
+    ) -> Result<Self, SctpError> {
         if addrs.is_empty() {
             return Err(SctpError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "no connect addresses",
             )));
         }
-        let domain = if addrs.iter().any(SocketAddr::is_ipv6) {
+        if let Some(first) = local.first() {
+            if local.iter().any(|a| a.port() != first.port()) {
+                return Err(SctpError::InvalidAddress(
+                    "the local addresses of one endpoint share one port".to_string(),
+                ));
+            }
+        }
+        let domain = if addrs.iter().chain(local).any(SocketAddr::is_ipv6) {
             libc::AF_INET6
         } else {
             libc::AF_INET
@@ -143,8 +182,8 @@ impl SctpAssociation {
         if fd < 0 {
             return Err(SctpError::Io(io::Error::last_os_error()));
         }
-        // From here on, close the fd on any early return.
-        let guard = FdGuard(fd);
+        // The socket owns the fd from here on and closes it on any return.
+        let socket = SctpSocket { fd };
 
         set_nonblocking(fd)?;
         if domain == libc::AF_INET6 {
@@ -152,9 +191,11 @@ impl SctpAssociation {
         }
         config.apply(fd)?;
         configure_events(fd)?;
+        if !local.is_empty() {
+            bind_local(fd, local)?;
+        }
 
-        let inner = AsyncFd::new(SctpSocket { fd })?;
-        guard.disarm(); // ownership moved into SctpSocket
+        let inner = AsyncFd::new(socket)?;
 
         let packed = addr::pack(addrs);
         let mut assoc_id: i32 = 0;
@@ -173,11 +214,11 @@ impl SctpAssociation {
             }
         }
 
-        inner.writable().await?.retain_ready();
-        check_so_error(inner.as_raw_fd())?;
+        established(&inner).await?;
         Ok(Self {
             inner,
             recv_state: Mutex::new(Reassembly::default()),
+            ended: Semaphore::new(0),
         })
     }
 
@@ -193,6 +234,9 @@ impl SctpAssociation {
     }
 
     /// Send with explicit [`SendOptions`] (unordered / PR-SCTP / abort / eof).
+    ///
+    /// A send waits while the send buffer is full. It ends with an error when
+    /// the association is lost meanwhile.
     pub async fn send_with(
         &self,
         data: &[u8],
@@ -201,7 +245,16 @@ impl SctpAssociation {
         opts: &SendOptions,
     ) -> Result<usize, SctpError> {
         loop {
-            let mut guard = self.inner.writable().await?;
+            // Room in the send buffer, or the end of the association. A lost
+            // association frees no room and does not make the socket
+            // writable: the kernel reports an error, which is waited for as
+            // well, and a receive that reads the notification of the loss
+            // closes `ended`. The send that follows returns the error.
+            let mut guard = tokio::select! {
+                biased;
+                guard = self.inner.ready(Interest::WRITABLE | Interest::ERROR) => guard?,
+                _ = self.ended.acquire() => return Err(SctpError::NotConnected),
+            };
             let ret = unsafe {
                 sys::sctp_sendmsg(
                     self.inner.as_raw_fd(),
@@ -233,7 +286,9 @@ impl SctpAssociation {
     /// than one `sctp_recvmsg` is reassembled internally (accumulated until
     /// `MSG_EOR`), so the caller always gets whole messages. SCTP notifications
     /// (COMM_UP, COMM_LOST, …) are skipped transparently — use
-    /// [`recv_msg`](Self::recv_msg) if you need to observe them.
+    /// [`recv_msg`](Self::recv_msg) if you need to observe them. Once the kernel
+    /// has said the association is over (lost, aborted, shut down), a receive
+    /// that finds nothing queued returns an error instead of waiting.
     ///
     /// Reassembling a large message spans several syscalls across `await`, but the
     /// accumulator lives in the association, so `recv` is cancel-safe: a future
@@ -270,12 +325,23 @@ impl SctpAssociation {
 
             match step {
                 Step::WouldBlock => {
+                    // Nothing is queued and nothing will be: the association
+                    // is over, and a socket whose error was handed to a
+                    // concurrent `send` never becomes readable again.
+                    if self.ended.is_closed() {
+                        return Err(SctpError::NotConnected);
+                    }
                     guard.clear_ready();
                     continue;
                 }
                 // Fragment committed; keep the retained readiness and read the next.
                 Step::More => continue,
-                Step::Notification(n) => return Ok(RecvResult::Notification(n)),
+                Step::Notification(n) => {
+                    if ends(&n) {
+                        self.ended.close();
+                    }
+                    return Ok(RecvResult::Notification(n));
+                }
                 Step::Complete(data, info, _addr) => return Ok(RecvResult::Data(data, info)),
                 Step::Err(e) => return Err(e),
             }
@@ -317,6 +383,21 @@ impl SctpAssociation {
     }
 }
 
+/// Whether a notification says the association is over: it was lost or
+/// aborted, its shutdown completed, or it never came up. What was received
+/// before is still delivered; after it nothing arrives.
+fn ends(notification: &Notification) -> bool {
+    matches!(
+        notification,
+        Notification::AssocChange(change) if matches!(
+            change.state,
+            AssocChangeState::CommLost
+                | AssocChangeState::ShutdownComp
+                | AssocChangeState::CantStrAssoc
+        )
+    )
+}
+
 /// Result of receiving on an association: application data or a notification.
 #[derive(Debug)]
 pub enum RecvResult {
@@ -328,21 +409,112 @@ pub enum RecvResult {
 
 // ── shared fd helpers ───────────────────────────────────────────────────────
 
-/// Closes a raw fd on drop unless disarmed — for cleanup on the error paths
-/// between `socket()` and handing the fd to an owner.
-struct FdGuard(RawFd);
-impl FdGuard {
-    fn disarm(mut self) {
-        self.0 = -1;
-        std::mem::forget(self);
+/// Bind a client socket to its local addresses before it connects.
+fn bind_local(fd: RawFd, local: &[SocketAddr]) -> Result<(), SctpError> {
+    // As on a listener: a port whose last association is still shutting down
+    // can be bound again.
+    let on: libc::c_int = 1;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &on as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
     }
-}
-impl Drop for FdGuard {
-    fn drop(&mut self) {
-        if self.0 >= 0 {
-            unsafe { libc::close(self.0) };
+    let Some(primary) = local.first() else {
+        return Ok(());
+    };
+    let (sockaddr, socklen) = addr::to_raw(primary);
+    if unsafe { libc::bind(fd, &sockaddr as *const _ as *const libc::sockaddr, socklen) } < 0 {
+        return Err(SctpError::Io(io::Error::last_os_error()));
+    }
+    if local.len() > 1 {
+        // The kernel takes port 0 here as the port the socket has by now.
+        let packed = addr::pack(&local[1..]);
+        let ret = unsafe {
+            sys::sctp_bindx(
+                fd,
+                packed.as_ptr() as *const libc::sockaddr,
+                (local.len() - 1) as libc::c_int,
+                sys::SCTP_BINDX_ADD_ADDR,
+            )
+        };
+        if ret < 0 {
+            return Err(SctpError::Io(io::Error::last_os_error()));
         }
     }
+    Ok(())
+}
+
+/// What a socket that is connecting has come to.
+enum Connecting {
+    Established,
+    Failed,
+    Pending,
+}
+
+/// Ask the kernel, without waiting, whether the socket can be written to.
+fn probe(fd: RawFd) -> Connecting {
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    let ret = unsafe { libc::poll(&mut pollfd, 1, 0) };
+    if ret > 0 && pollfd.revents & libc::POLLOUT != 0 {
+        Connecting::Established
+    } else if ret > 0 && pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+        Connecting::Failed
+    } else {
+        Connecting::Pending
+    }
+}
+
+/// Wait for the outcome of a non-blocking connect.
+///
+/// An association that comes up makes the socket writable. One that does not
+/// (the far end answers the INIT with an ABORT, or the INIT is given up) sets
+/// the socket error and, as the socket subscribes to association events,
+/// queues the notification that says so: the kernel then reports error plus
+/// readable, which the runtime counts as neither writable nor write-closed. So
+/// both directions are waited for, and the socket error decides.
+async fn established(inner: &AsyncFd<SctpSocket>) -> Result<(), SctpError> {
+    let fd = inner.as_raw_fd();
+    // Readable for a reason that decides nothing: what is queued stays for
+    // `recv`, and only writability is waited for from then on.
+    let mut both = true;
+    loop {
+        let outcome = tokio::select! {
+            biased;
+            guard = inner.writable() => {
+                let mut guard = guard?;
+                let outcome = outcome(fd)?;
+                if matches!(outcome, Connecting::Pending) {
+                    guard.clear_ready();
+                }
+                outcome
+            }
+            guard = inner.readable(), if both => {
+                guard?.retain_ready();
+                both = false;
+                outcome(fd)?
+            }
+        };
+        match outcome {
+            Connecting::Established => return Ok(()),
+            // Closed, with no error left on the socket to say why.
+            Connecting::Failed => return Err(SctpError::NotConnected),
+            Connecting::Pending => {}
+        }
+    }
+}
+
+/// The socket error if there is one, else what the kernel says of the socket.
+fn outcome(fd: RawFd) -> Result<Connecting, SctpError> {
+    check_so_error(fd)?;
+    Ok(probe(fd))
 }
 
 pub(crate) fn set_nonblocking(fd: RawFd) -> Result<(), SctpError> {

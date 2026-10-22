@@ -68,3 +68,24 @@ async def test_one_to_many_and_peeloff():
 def test_bad_address_raises():
     with pytest.raises(ValueError):
         sctp.SctpListener.bind("not-an-address")
+
+
+@pytest.mark.asyncio
+async def test_connect_from_local_addrs():
+    listener = sctp.SctpListener.bind("127.0.0.1:0")
+    bound = listener.local_addr()
+
+    async def server():
+        assoc, peer = await listener.accept()
+        peers = assoc.peer_addrs()
+        await assoc.send(b"seen", 0, sctp.M3UA)
+        return peer, peers
+
+    task = asyncio.create_task(server())
+    client = await sctp.SctpAssociation.connect_multi(
+        [bound], local_addrs=["127.0.0.2:0", "127.0.0.3:0"]
+    )
+    await client.recv()
+    peer, peers = await task
+    assert peer.split(":")[0] in ("127.0.0.2", "127.0.0.3")
+    assert sorted(p.split(":")[0] for p in peers) == ["127.0.0.2", "127.0.0.3"]

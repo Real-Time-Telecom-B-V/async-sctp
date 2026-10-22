@@ -5,6 +5,53 @@ All notable changes are documented here. The format follows
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See
 [VERSIONING.md](VERSIONING.md) for the compatibility policy.
 
+## [1.1.0]
+
+### Added
+- `SctpAssociation::connect_from(local, peer, config)`: bind a client socket to
+  its local addresses and port (`bind`, then `sctp_bindx` for a multihomed
+  endpoint) before `sctp_connectx`. A peer that tells its associations apart
+  by remote address and port needs the client to come from the ones it was
+  given; an unbound socket offers every address of the host and an ephemeral
+  port. Port `0` leaves the port to the kernel. Python: the keyword
+  `local_addrs` of `SctpAssociation.connect_multi`.
+
+### Fixed
+- A connect that failed could wait forever. A refused association (the far end
+  answers the INIT with an ABORT) or an INIT that is given up sets the socket
+  error and queues the association-change notification, which the kernel
+  reports as error plus readable; the connect waited for writable only, and
+  that set of events is neither writable nor write-closed to the runtime. The
+  connect now waits for either direction and returns the socket error
+  (`ECONNREFUSED`, `ETIMEDOUT`).
+- A receive on an association that was lost could wait forever. When the
+  association is aborted while another task of the same side is sending, the
+  send can be handed the socket error; `recv` then read the notification that
+  the association was lost, skipped it, and waited on a socket that never
+  becomes readable again. Once the kernel has said the association is over
+  (`COMM_LOST`, `SHUTDOWN_COMP`, `CANT_STR_ASSOC`), `recv` and `recv_msg` return
+  what is still queued and then `SctpError::NotConnected`.
+- A send that waited for room in the send buffer could wait forever when the
+  association was lost meanwhile: a lost association frees no room, and the
+  error the kernel reports for it is not writability. A waiting send is now
+  woken by the socket error and by a receive that read the notification of the
+  loss, and returns the error.
+- A socket whose registration with the runtime failed during a connect was
+  closed twice.
+- `recv` and `recv_msg` return a message that the kernel delivered in several
+  parts (larger than the receive buffer of one call) whole, and stay
+  cancel-safe while they put it together.
+
+### Changed
+- The minimum `tokio` is 1.32 (awaiting error readiness), and its `sync`
+  feature is enabled.
+
+### Notes
+- A client bound to a fixed local port that connects again right after its
+  association was closed can wait for one INIT retransmission (the initial
+  retransmission timeout of the kernel, 3 seconds by default) while the far
+  end finishes the shutdown of the previous association.
+
 ## [1.0.0]
 
 First published release — async SCTP over the Linux kernel stack (lksctp), for
@@ -36,4 +83,5 @@ Rust and Python from one source tree.
   one-to-many, multihoming), a counting-allocator leak check, a throughput
   driver, async pytest parity, and CI that loads the `sctp` module.
 
+[1.1.0]: https://github.com/Real-Time-Telecom-B-V/async-sctp/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Real-Time-Telecom-B-V/async-sctp/releases/tag/v1.0.0
